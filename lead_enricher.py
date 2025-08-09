@@ -22,40 +22,39 @@ BATCH_SIZE = 5
 
 # --- PROMPT ENGINEERING SECTION ---
 # This is the main prompt sent for each batch of leads.
-# The '{leads_json}' placeholder will be replaced with the actual lead data.
+# The '{leads_csv}' placeholder will be replaced with the actual lead data.
 MAIN_PROMPT_TEMPLATE = """
 You are an expert lead enrichment AI optimized for batch processing.
 
 Input: A batch of leads as a CSV file content.
+
+<DOCUMENT filename="leads.csv">
+{leads_csv}												
+</DOCUMENT>
 
 Your task: enrich each lead with the required fields, and output ONLY the enriched leads as a **CSV string**, including all original columns plus new enrichment columns.
 
 **Important:**
 
 - Do NOT include any explanation, commentary, or summary.  
-- Respond ONLY with the CSV string enclosed in triple backticks (```csv ... ```).  
+- Respond ONLY with the CSV string enclosed in triple backticks (```csv
 - The CSV must be properly formatted and parsable.
 
 Here is the CSV header you must include exactly as the first row:
 
-Agency Name,Agency LinkedIn URL,ICP Score,Funding Details,Business Description,Pain Points Noted,Decision Maker Name,LinkedIn Profile,X Handle,MRR,Annual Revenue,Accounting - Departmental Head Count,Finance - Department Head Count,Decision Maker First Name,Decision Maker Last Name,Decision Maker Linkedin Profile URL,Connection Request Message,Follow-Up on Unaccepted Connection,Message After Connection Acceptance,Follow-Up Message (No Reply After Acceptance),Second Follow-Up Message (Persistent No Reply),Initial Outreach Message (Reference Pain Point, No Pitch),First Follow-Up Message (Prompt for Response),Second Follow-Up Message (After No Reply)
+Agency Name,Agency LinkedIn URL,ICP Score,Funding Details,Business Description,Pain Points Noted,Decision Maker Name,Decision Maker LinkedIn Profile,X Handle,MRR,Annual Revenue,Accounting - Departmental Head Count,Finance - Department Head Count,Decision Maker First Name,Decision Maker Last Name,Decision Maker Linkedin Profile URL,Connection Request Message,Follow-Up on Unaccepted Connection,Message After Connection Acceptance,Follow-Up Message (No Reply After Acceptance),Second Follow-Up Message (Persistent No Reply),Initial Outreach Message (Reference Pain Point, No Pitch),First Follow-Up Message (Prompt for Response),Second Follow-Up Message (After No Reply)
 
 Process the input leads and enrich them accordingly.
-
-Respond only with the CSV string, wrapped in:
-
-```csv
-<DOCUMENT filename="leads.csv">
-	{leads_json}												
-</DOCUMENT>
-
 """
 
 # This is the follow-up prompt. It can be used to ask for more details or corrections.
-SUB_PROMPT = """Process the next batch of 5 rows
+SUB_PROMPT = """
+As before, enrich the next batch of leads as a CSV file content and output ONLY the enriched CSV string enclosed in triple backticks (```csv ... ```).
+
 <DOCUMENT filename="leads.csv">
-	{leads_json}												
-</DOCUMENT>"""
+{leads_csv}												
+</DOCUMENT>
+"""
 
 
 def setup_driver():
@@ -79,7 +78,7 @@ def setup_driver():
 def read_leads_in_batches(df, batch_size):
     """Yields batches of leads from a DataFrame."""
     for i in range(0, len(df), batch_size):
-        yield df.iloc[i:i + batch_size].to_dict('records')
+        yield df.iloc[i:i + batch_size]
 
 def send_prompt(driver, prompt):
     """Finds the chat input box, sends the prompt, and presses Enter."""
@@ -126,21 +125,18 @@ def get_latest_response(driver):
                 time.sleep(0.5)
                 continue
 
-                if current_text == last_text and current_text != "":
-                    stable_count += 1
-                    if stable_count >= 3:  # Stable for 3 seconds
-                        print("Message stabilized. Processing...")
-                        break
-                else:
-                    stable_count = 0
-                    if len(current_text) > len(last_text):
-                         print(f"Response updating... new length: {len(current_text)} characters")
-                    last_text = current_text
+            if current_text == last_text and current_text != "":
+                stable_count += 1
+                if stable_count >= 3:  # Stable for 3 seconds
+                    print("Message stabilized. Processing...")
+                    break
+            else:
+                stable_count = 0
+                if len(current_text) > len(last_text):
+                    print(f"Response updating... new length: {len(current_text)} characters")
+                last_text = current_text
 
-                time.sleep(1)
-            except Exception as e:
-                print(f"Error while checking for response stability: {e}")
-                time.sleep(1)
+            time.sleep(1)
         else:
             print("Warning: Timed out waiting for response to stabilize.")
 
@@ -357,7 +353,7 @@ def main():
 
     is_first_batch = True
 
-    for batch in lead_batches:
+    for batch_df in lead_batches:
         if not is_first_batch:
             # The wait for the AI response to generate serves as a natural rate limit.
             # The hardcoded sleep is removed to accelerate processing.
@@ -369,10 +365,18 @@ def main():
             prompt_template = MAIN_PROMPT_TEMPLATE
         
         # Format the chosen prompt with the current batch of leads
-        leads_json_str = json.dumps(batch, indent=2)
-        prompt = prompt_template.format(leads_json=leads_json_str)
+        leads_csv = batch_df.to_csv(index=False)
+        prompt = prompt_template.format(leads_csv=leads_csv)
+        
+        # Wait for new response: Get current count before sending
+        current_num_responses = len(driver.find_elements(By.CSS_SELECTOR, "div.response-content-markdown"))
         
         send_prompt(driver, prompt)
+        
+        # Wait for a new response to appear
+        WebDriverWait(driver, 60).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.response-content-markdown")) > current_num_responses
+        )
         
         enriched_data = get_latest_response(driver)
         
