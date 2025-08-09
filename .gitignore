@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Selenium
+selenium/
+
+# IDEs
+.vscode/
+.idea/
+
+# Output
+enriched_leads.csv
