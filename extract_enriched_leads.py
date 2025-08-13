@@ -80,7 +80,9 @@ def parse_and_append_csv(csv_text, output_file):
         # -------------------------------------------------
 
         # Load existing data and combine
+        print(f"--> Reading existing data from {output_file}...")
         df_existing = pd.read_csv(output_file)
+        print(f"--> Found {len(df_existing)} existing leads.")
         df_combined = pd.concat([df_existing, df_new], ignore_index=True)
 
         # Deduplicate if possible
@@ -90,8 +92,9 @@ def parse_and_append_csv(csv_text, output_file):
             print("--> Warning: 'Agency Name' column not found. Cannot deduplicate this batch.")
 
         # Save back to the file
+        print(f"--> Writing {len(df_combined)} total leads back to {output_file}...")
         df_combined.to_csv(output_file, index=False)
-        print(f"--> Successfully processed and saved {len(df_new)} lead(s). Total unique leads: {len(df_combined)}.")
+        print(f"--> Successfully processed and saved {len(df_new)} new lead(s). Total unique leads: {len(df_combined)}.")
         return True
     except Exception as e:
         print(f"--> Skipping response due to critical parsing error: {e}")

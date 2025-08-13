@@ -49,7 +49,7 @@ Process the input leads and enrich them accordingly.
 
 # This is the follow-up prompt. It can be used to ask for more details or corrections.
 SUB_PROMPT = """
-As before, enrich the next batch of leads as a CSV file content and output ONLY the enriched CSV string enclosed in triple backticks (```csv ... ```).
+As before, enrich the next batch of leads as a CSV file content and output ONLY the enriched CSV string enclosed in triple backticks (```csv
 
 <DOCUMENT filename="leads.csv">
 {leads_csv}												
@@ -95,193 +95,120 @@ def send_prompt(driver, prompt):
     except Exception as e:
         print(f"Error sending prompt: {e}")
 
-def get_latest_response(driver):
-    """Waits for and extracts the latest response from the AI."""
+def get_unprocessed_leads(max_leads=250):
+    """Prepares a list of unprocessed leads based on LinkedIn URL, creates a temp CSV, and returns the DataFrame."""
     try:
-        # Wait for a response container to be present
-        WebDriverWait(driver, 60).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.response-content-markdown"))
-        )
-        print("AI response detected. Waiting for it to stabilize...")
+        all_leads_df = pd.read_csv(CSV_INPUT_FILE)
+        print(f"Loaded {len(all_leads_df)} total leads from {CSV_INPUT_FILE}.")
+    except FileNotFoundError:
+        print(f"Error: Input file '{CSV_INPUT_FILE}' not found. Please create it.")
+        return pd.DataFrame(), None
 
+    if 'Agency LinkedIn URL' not in all_leads_df.columns:
+        print(f"Error: 'Agency LinkedIn URL' column not found in '{CSV_INPUT_FILE}'.")
+        print(f"Available columns: {list(all_leads_df.columns)}")
+        return pd.DataFrame(), None
+
+    # Only check the all_enriched_leads.csv file to track processed leads
+    try:
+        all_enriched_df = pd.read_csv('all_enriched_leads.csv')
+        print(f"Loaded {len(all_enriched_df)} enriched leads from all_enriched_leads.csv")
+        processed_urls = set(all_enriched_df['Agency LinkedIn URL'].dropna().tolist())
+        print(f"Found {len(processed_urls)} unique processed LinkedIn URLs")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        all_enriched_df = pd.DataFrame()
+        processed_urls = set()
+        print("No existing all_enriched_leads.csv found. All leads will be considered unprocessed.")
+
+    # Find leads that haven't been processed yet
+    unprocessed = []
+    total_leads_checked = 0
+    log_interval = 50
+
+    print("Starting lead analysis...")
+    for index, lead in all_leads_df.iterrows():
+        total_leads_checked += 1
+        if total_leads_checked % log_interval == 0:
+            print(f"...checked {total_leads_checked} of {len(all_leads_df)} leads.")
+
+        url = lead['Agency LinkedIn URL']
+        if pd.isna(url) or url == '':
+            continue
+
+        # Include the lead if its URL is not in the processed URLs set
+        if url not in processed_urls:
+            unprocessed.append(lead)
+            if len(unprocessed) >= max_leads:
+                print(f"Reached the limit of {max_leads} unprocessed leads. Stopping search.")
+                break
+    
+    print(f"Analysis complete. Found {len(unprocessed)} leads to process.")
+
+    unprocessed_df = pd.DataFrame(unprocessed)
+    unprocessed_df = unprocessed_df.head(max_leads)
+    print(f"--> Selecting the top {len(unprocessed_df)} leads for the next batch.")
+
+    if unprocessed_df.empty:
+        print("No leads need processing.")
+        return unprocessed_df, None
+
+    temp_csv = 'temp_leads.csv'
+    print(f"--> Clearing and writing {len(unprocessed_df)} leads to temporary file '{temp_csv}'...")
+    unprocessed_df.to_csv(temp_csv, index=False)
+    print(f"--> Successfully created temporary CSV '{temp_csv}'.")
+
+    return unprocessed_df, temp_csv
+
+def wait_for_response_stabilization(driver, previous_response_count):
+    """Waits for a new AI response to appear and for its content to stabilize."""
+    print("Waiting for AI response to generate and stabilize...")
+    try:
+        # 1. Wait for a new response container to appear
+        WebDriverWait(driver, 60).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.response-content-markdown")) > previous_response_count
+        )
+        print("New response detected. Monitoring for stabilization...")
+
+        # 2. Monitor the last response for stabilization
         timeout_seconds = 120  # 2 minutes
         start_time = time.time()
-        last_text = ""  # Initialize BEFORE the loop
+        last_text = ""
         stable_count = 0
 
         while time.time() - start_time < timeout_seconds:
             try:
-                # Find the last response container
                 response_containers = driver.find_elements(By.CSS_SELECTOR, "div.response-content-markdown")
-                if not response_containers:
-                    time.sleep(1)
+                # Ensure we are looking at the new response
+                if len(response_containers) <= previous_response_count:
+                    time.sleep(0.5)
                     continue
-
-                # Use innerText for a more reliable text capture
+                
                 current_text = response_containers[-1].get_attribute('innerText') or ""
             except StaleElementReferenceException:
-                # The element was updated in the DOM, just continue and re-find it
                 print("Handled a stale element. Retrying...")
                 time.sleep(0.5)
                 continue
 
-            if current_text == last_text and current_text != "":
+            # Check for stability
+            if current_text == last_text and len(current_text) > 100: # Ensure it's not empty
                 stable_count += 1
                 if stable_count >= 3:  # Stable for 3 seconds
-                    print("Message stabilized. Processing...")
-                    break
+                    print(f"Response stabilized with {len(current_text)} characters. Proceeding.")
+                    return
             else:
                 stable_count = 0
                 if len(current_text) > len(last_text):
-                    print(f"Response updating... new length: {len(current_text)} characters")
+                    print(f"Response updating... length: {len(current_text)} characters")
                 last_text = current_text
 
             time.sleep(1)
-        else:
-            print("Warning: Timed out waiting for response to stabilize.")
+        
+        print("Warning: Timed out waiting for response to stabilize, but proceeding anyway.")
 
-        # --- Final Extraction --- 
-        # After stabilization or timeout, get the definitive final content.
-        final_response_elements = driver.find_elements(By.CSS_SELECTOR, 'div.response-content-markdown code')
-        if not final_response_elements:
-            print("Primary selector '... code' failed. Trying fallback 'div.response-content-markdown'.")
-            final_response_elements = driver.find_elements(By.CSS_SELECTOR, 'div.response-content-markdown')
-
-        if not final_response_elements:
-            print("Error: Could not find any response element after waiting.")
-            return None
-
-        final_text = final_response_elements[-1].get_attribute('innerText')
-        if not final_text or not final_text.strip():
-            print("Warning: Captured final message is empty.")
-            return None
-
-        final_text = final_text.strip()
-        print(f"Final message length: {len(final_text)} characters")
-        print("--- Captured AI Response ---")
-        print(final_text[:800] + ('...' if len(final_text) > 800 else ''))
-        print("----------------------------")
-        return final_text
-
+    except TimeoutException:
+        print("Warning: Timed out waiting for a new response to appear. Proceeding might cause issues.")
     except Exception as e:
-        print(f"Fatal error in get_latest_response: {e}")
-        return None
-
-def save_enriched_data(data, filename):
-    """Appends a list of enriched data to the output CSV file."""
-    # Helper to extract and normalize different response formats to a DataFrame
-    def _extract_code_block(text: str) -> str | None:
-        import re
-        match = re.search(r"```(?:\w+)?\s*([\s\S]*?)```", text)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    def _parse_markdown_table(text: str) -> pd.DataFrame | None:
-        # Keep only lines with '|' to approximate markdown table
-        lines = [ln.strip() for ln in text.splitlines() if '|' in ln]
-        if len(lines) < 2:
-            return None
-        # Remove alignment row like: | --- | :---: | ---: |
-        cleaned = []
-        for ln in lines:
-            parts = [p.strip() for p in ln.strip('|').split('|')]
-            if all(set(p) <= set('-: ') and p for p in parts):
-                # alignment row, skip
-                continue
-            cleaned.append(ln)
-        if len(cleaned) < 2:
-            return None
-        try:
-            # Convert to CSV-like string
-            header = [h.strip() for h in cleaned[0].strip('|').split('|')]
-            rows = []
-            for ln in cleaned[1:]:
-                cols = [c.strip() for c in ln.strip('|').split('|')]
-                # Pad/truncate to header length
-                if len(cols) < len(header):
-                    cols += [''] * (len(header) - len(cols))
-                elif len(cols) > len(header):
-                    cols = cols[:len(header)]
-                rows.append(cols)
-            df = pd.DataFrame(rows, columns=header)
-            # Drop completely empty rows
-            df = df.dropna(how='all')
-            return df
-        except Exception:
-            return None
-
-    def _normalize_to_dataframe(d) -> pd.DataFrame | None:
-        # Already a DataFrame
-        if isinstance(d, pd.DataFrame):
-            return d
-        # List of dicts or list-like
-        if isinstance(d, list):
-            try:
-                return pd.DataFrame(d)
-            except Exception:
-                return None
-        # Single dict
-        if isinstance(d, dict):
-            try:
-                return pd.DataFrame([d])
-            except Exception:
-                return None
-        # String: could be JSON, CSV, or Markdown table
-        if isinstance(d, str):
-            text = d.strip()
-            # If the entire string is huge raw message, try to extract fenced block first
-            block = _extract_code_block(text)
-            candidate = block if block else text
-            # Try JSON
-            try:
-                obj = json.loads(candidate)
-                return _normalize_to_dataframe(obj)
-            except Exception:
-                pass
-            # Try CSV by locating the header
-            try:
-                lines = candidate.splitlines()
-                # Find the header row - it should contain expected column names
-                header_idx = -1
-                for i, line in enumerate(lines):
-                    # A good heuristic for the header is the presence of several commas
-                    if 'Agency Name' in line and 'ICP Score' in line and line.count(',') > 5:
-                        header_idx = i
-                        break
-                
-                if header_idx != -1:
-                    # Reconstruct the CSV from the header onwards
-                    csv_data = "\n".join(lines[header_idx:])
-                    return pd.read_csv(io.StringIO(csv_data))
-            except Exception:
-                pass
-            # Try Markdown table
-            md_df = _parse_markdown_table(candidate)
-            if md_df is not None:
-                return md_df
-            return None
-        return None
-
-    if data is None:
-        print("No data passed to save_enriched_data; skipping.")
-        return
-
-    df = _normalize_to_dataframe(data)
-    if df is None or df.empty:
-        # Provide a short preview for debugging
-        preview = (data[:200] + '...') if isinstance(data, str) and len(data) > 200 else data
-        print(f"Could not parse AI response into a table. Nothing saved. Preview: {preview}")
-        return
-
-    print(f"Saving {len(df)} enriched leads to {filename}...")
-    try:
-        # Append to the file, creating it if it doesn't exist.
-        header_needed = not os.path.isfile(filename)
-        df.to_csv(filename, mode='a', header=header_needed, index=False)
-        print("Data saved successfully.")
-    except Exception as e:
-        print(f"Error saving data to CSV: {e}")
+        print(f"An error occurred while waiting for response: {e}")
 
 def main():
     """Main function to orchestrate the lead enrichment process."""
@@ -291,73 +218,26 @@ def main():
     # Manual intervention step
     input("Please log in to Grok, select your desired workspace, and then press Enter here to continue...")
 
-    # --- Resume Logic: Read inputs and skip already enriched leads ---
-    try:
-        all_leads_df = pd.read_csv(CSV_INPUT_FILE)
-        print(f"Loaded {len(all_leads_df)} total leads from {CSV_INPUT_FILE}.")
-    except FileNotFoundError:
-        print(f"Error: Input file '{CSV_INPUT_FILE}' not found. Please create it.")
-        return
+    # Get unprocessed leads and create a temporary CSV for this session
+    print("\nChecking for unprocessed leads and creating temporary file...")
+    unprocessed_leads_df, temp_csv = get_unprocessed_leads()
 
-    # Validate that the input CSV has an identifier column and choose the best one
-    preferred_cols = ["Agency Name", "Name"]
-    available_id_cols = [c for c in preferred_cols if c in all_leads_df.columns]
-    if not available_id_cols:
-        print(f"Error: None of the identifier columns {preferred_cols} found in '{CSV_INPUT_FILE}'.")
-        print(f"Available columns in '{CSV_INPUT_FILE}': {list(all_leads_df.columns)}")
-        return
-    required_column = available_id_cols[0]
-    print(f"Using '{required_column}' as the lead identifier from '{CSV_INPUT_FILE}'.")
-
-    if os.path.exists(CSV_OUTPUT_FILE):
-        try:
-            enriched_df = pd.read_csv(CSV_OUTPUT_FILE)
-            print(f"Found existing '{CSV_OUTPUT_FILE}'.")
-            # Validate that the enriched CSV also has an identifier column
-            if required_column in enriched_df.columns:
-                id_col_used = required_column
-            else:
-                # Try the alternative identifier in enriched CSV
-                alternatives = [c for c in preferred_cols if c != required_column and c in enriched_df.columns]
-                if alternatives:
-                    id_col_used = alternatives[0]
-                    print(f"Note: Using '{id_col_used}' from '{CSV_OUTPUT_FILE}' to determine processed leads (different from input's '{required_column}').")
-                else:
-                    id_col_used = None
-
-            if id_col_used:
-                processed_leads = set(enriched_df[id_col_used].dropna().unique())
-                print(f"Found {len(processed_leads)} already enriched leads in {CSV_OUTPUT_FILE} using '{id_col_used}'.")
-            else:
-                processed_leads = set()
-                print(f"Warning: None of the identifier columns {preferred_cols} found in {CSV_OUTPUT_FILE}. Starting from scratch.")
-                print(f"Available columns in '{CSV_OUTPUT_FILE}': {list(enriched_df.columns) if not enriched_df.empty else '(None)'}")
-        except pd.errors.EmptyDataError:
-            processed_leads = set()
-            print(f"Warning: {CSV_OUTPUT_FILE} is empty. Starting from scratch.")
-    else:
-        processed_leads = set()
-        print(f"No existing {CSV_OUTPUT_FILE} found. Starting fresh.")
-
-    # Filter out processed leads
-    unprocessed_leads_df = all_leads_df[~all_leads_df[required_column].isin(processed_leads)]
-    
     if unprocessed_leads_df.empty:
-        print("All leads from the input file have already been enriched. Exiting.")
+        print("All leads are already fully enriched or no leads to process. Exiting.")
+        driver.quit()
         return
 
-    print(f"Found {len(unprocessed_leads_df)} new leads to process.")
+    print(f"Found {len(unprocessed_leads_df)} leads to process.")
 
     # Get lead batches from the unprocessed DataFrame
     lead_batches = read_leads_in_batches(unprocessed_leads_df, BATCH_SIZE)
 
     is_first_batch = True
+    batch_num = 1
+    total_batches = -(-len(unprocessed_leads_df) // BATCH_SIZE)  # Ceiling division
 
     for batch_df in lead_batches:
         if not is_first_batch:
-            # The wait for the AI response to generate serves as a natural rate limit.
-            # The hardcoded sleep is removed to accelerate processing.
-            pass
             # Use the sub-prompt for subsequent batches
             prompt_template = SUB_PROMPT
         else:
@@ -370,22 +250,15 @@ def main():
         
         # Wait for new response: Get current count before sending
         current_num_responses = len(driver.find_elements(By.CSS_SELECTOR, "div.response-content-markdown"))
+        print(f"\n--- Sending Batch {batch_num}/{total_batches} ---")
         
         send_prompt(driver, prompt)
-        
-        # Wait for a new response to appear
-        WebDriverWait(driver, 60).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.response-content-markdown")) > current_num_responses
-        )
-        
-        enriched_data = get_latest_response(driver)
-        
-        if enriched_data:
-            save_enriched_data(enriched_data, CSV_OUTPUT_FILE)
-        else:
-            print("Skipping save due to an error in the previous step.")
 
+        # Wait for the response to be fully generated before sending the next prompt
+        wait_for_response_stabilization(driver, current_num_responses)
+        
         is_first_batch = False
+        batch_num += 1
 
     print("\nAll leads have been processed.")
     driver.quit()
